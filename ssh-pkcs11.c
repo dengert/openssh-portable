@@ -216,6 +216,37 @@ pkcs11_find(struct pkcs11_provider *p, CK_ULONG slotidx, CK_ATTRIBUTE *attr,
 	return (ret);
 }
 
+/* read pin and do C_Login of type CKU_USER or CKU_CONTEXT_SPECIFIC */
+static int
+pkcs11_c_login(struct pkcs11_provider *provider, struct pkcs11_slotinfo *si, int cku, char **pin)
+{
+	CK_FUNCTION_LIST        *f;
+	CK_RV                   rv;
+	char			prompt[1041];
+
+	f = provider->function_list;
+	if (*pin == NULL) {
+		if (si->token.flags & CKF_PROTECTED_AUTHENTICATION_PATH)
+			verbose("Deferring PIN entry to reader keypad.");
+		else {
+			snprintf(prompt, sizeof(prompt),
+			    "Enter%s PIN for '%s': ", cku==CKU_CONTEXT_SPECIFIC?" Context Specific":"", si->token.label);
+			*pin = read_passphrase(prompt, RP_ALLOW_EOF);
+			if (*pin == NULL)
+				return (-1);	/* bail out */
+		}
+	}
+	rv = f->C_Login(si->session, cku, (u_char *)*pin,
+	    (*pin != NULL) ? strlen(*pin) : 0);
+	    /* caller must zero out pin */
+	if (rv != CKR_OK && rv != CKR_USER_ALREADY_LOGGED_IN) {
+		error("C_Login failed: %lu", rv);
+		return (-1);
+	}
+	return 0;
+}
+
+
 /* openssl callback doing the actual signing operation */
 static int
 pkcs11_rsa_private_encrypt(int flen, const u_char *from, u_char *to, RSA *rsa,
@@ -237,7 +268,12 @@ pkcs11_rsa_private_encrypt(int flen, const u_char *from, u_char *to, RSA *rsa,
 		{CKA_ID, NULL, 0},
 		{CKA_SIGN, NULL, sizeof(true_val) }
 	};
-	char			*pin = NULL, prompt[1024];
+	CK_BBOOL		cka_always_authenticate = CK_FALSE;
+	CK_ATTRIBUTE		key_cka_always_authenticate[] = {
+		{CKA_ALWAYS_AUTHENTICATE, &cka_always_authenticate, sizeof(cka_always_authenticate) }
+	};
+		 
+	char			*pin = NULL;
 	int			rval = -1;
 
 	key_filter[0].pValue = &private_key_class;
@@ -260,25 +296,9 @@ pkcs11_rsa_private_encrypt(int flen, const u_char *from, u_char *to, RSA *rsa,
 			    " on reader keypad" : "");
 			return (-1);
 		}
-		if (si->token.flags & CKF_PROTECTED_AUTHENTICATION_PATH)
-			verbose("Deferring PIN entry to reader keypad.");
-		else {
-			snprintf(prompt, sizeof(prompt),
-			    "Enter PIN for '%s': ", si->token.label);
-			pin = read_passphrase(prompt, RP_ALLOW_EOF);
-			if (pin == NULL)
-				return (-1);	/* bail out */
-		}
-		rv = f->C_Login(si->session, CKU_USER, (u_char *)pin,
-		    (pin != NULL) ? strlen(pin) : 0);
-		if (pin != NULL) {
-			explicit_bzero(pin, strlen(pin));
-			free(pin);
-		}
-		if (rv != CKR_OK && rv != CKR_USER_ALREADY_LOGGED_IN) {
-			error("C_Login failed: %lu", rv);
-			return (-1);
-		}
+		rv = pkcs11_c_login(k11->provider, si, CKU_USER, &pin);
+		if (rv  != 0)
+		    return (-1);
 		si->logged_in = 1;
 	}
 	key_filter[1].pValue = k11->keyid;
@@ -287,16 +307,34 @@ pkcs11_rsa_private_encrypt(int flen, const u_char *from, u_char *to, RSA *rsa,
 	if (pkcs11_find(k11->provider, k11->slotidx, key_filter, 3, &obj) < 0 &&
 	    pkcs11_find(k11->provider, k11->slotidx, key_filter, 2, &obj) < 0) {
 		error("cannot find private key");
-	} else if ((rv = f->C_SignInit(si->session, &mech, obj)) != CKR_OK) {
-		error("C_SignInit failed: %lu", rv);
-	} else {
-		/* XXX handle CKR_BUFFER_TOO_SMALL */
-		tlen = RSA_size(rsa);
-		rv = f->C_Sign(si->session, (CK_BYTE *)from, flen, to, &tlen);
-		if (rv == CKR_OK) 
-			rval = tlen;
-		else 
-			error("C_Sign failed: %lu", rv);
+		goto fail;
+	}
+	/* If pkcs11 lib does support this, assume false get before C_SignInit */
+	f->C_GetAttributeValue(si->session, obj, key_cka_always_authenticate, 1);
+	if ((rv = f->C_SignInit(si->session, &mech, obj)) != CKR_OK) {
+			error("C_SignInit failed: %lu", rv);
+			goto fail;
+	}
+	if (cka_always_authenticate) {
+		/* if we have the PIN from above use it, or get it now */
+		rv = pkcs11_c_login(k11->provider, si, CKU_CONTEXT_SPECIFIC, &pin);
+		if (rv != CKR_OK && rv != CKR_USER_ALREADY_LOGGED_IN) {
+		    error("Context specific login failed %lu", rv);
+		    goto fail;
+		}
+	}
+	/* XXX handle CKR_BUFFER_TOO_SMALL */
+	tlen = RSA_size(rsa);
+	rv = f->C_Sign(si->session, (CK_BYTE *)from, flen, to, &tlen);
+	if (rv == CKR_OK)
+		rval = tlen;
+	else
+		error("C_Sign failed: %lu", rv);
+fail:
+	if (pin != NULL) {
+		explicit_bzero(pin, strlen(pin));
+		free(pin);
+		pin = NULL;
 	}
 	return (rval);
 }
